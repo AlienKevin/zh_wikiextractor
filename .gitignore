@@ -2,4 +2,5 @@
 *.xml
 *.bz2
 pages/
+htmls/
 .DS_Store
