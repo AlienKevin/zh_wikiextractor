@@ -1,3 +1,5 @@
 /target
 *.xml
 *.bz2
+pages/
+.DS_Store
