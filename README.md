@@ -1,3 +1,8 @@
+# Stats
+
+Number of articles: 1036759
+Folder size: 1.26GB
+
 # Increase URI size limit of Apache server
 
 1. Open `/etc/apache2/apache2.conf` and insert:

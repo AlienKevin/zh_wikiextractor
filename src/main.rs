@@ -408,3 +408,36 @@ fn main() {
         println!("{}: {}", variant, count);
     }
 }
+
+fn get_pages_stats() {
+    // Specify the path to the folder
+    let path = "pages/"; // Replace this with the path to the folder you're interested in
+
+    let mut num_files = 0;
+    let mut folder_size = 0;
+
+    // Read the directory
+    match std::fs::read_dir(path) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) => {
+                        let path = entry.path();
+                        if path.is_file() {
+                            // println!("File: {}", path.display());
+                            num_files += 1;
+                            folder_size += entry.metadata().unwrap().len();
+                        } else if path.is_dir() {
+                            println!("Dir: {}", path.display());
+                        }
+                    }
+                    Err(_) => println!("Error reading entry"),
+                }
+            }
+        }
+        Err(_) => println!("Error reading directory"),
+    }
+
+    println!("Number of files: {num_files}");
+    println!("Folder size: {folder_size} bytes");
+}
