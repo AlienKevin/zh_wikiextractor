@@ -1,12 +1,13 @@
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde::Deserialize;
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Write;
 use std::process::Command;
+use std::sync::mpsc;
+use std::thread;
 
 #[derive(Debug, Deserialize)]
 struct Parse {
@@ -31,7 +32,8 @@ fn request_parse(text: &str) -> Option<String> {
     let base_url = "http://localhost:8080/api.php";
     let text_arg = format!("text={}", text);
     let curl_args = vec![
-        "-G",
+        "-X",
+        "POST",
         base_url,
         "--data-urlencode",
         "action=parse",
@@ -96,8 +98,37 @@ fn main() {
         ("zh-tw".to_string(), 0),
     ]);
 
+    // Spawn worker threads
+    let mut handles = vec![];
+    let mut txs = vec![];
+    for _ in 0..20 {
+        let (tx, rx) = mpsc::channel::<(i32, String)>();
+        txs.push(tx);
+        let handle = thread::spawn(move || {
+            loop {
+                match rx.recv() {
+                    Ok((pageid, text)) => {
+                        let html_text = request_parse(&text);
+                        if let Some(html_text) = html_text {
+                            let file_name = format!("pages/{pageid}.html");
+                            let mut file = File::create(file_name).unwrap();
+                            file.write_all(html_text.as_bytes()).unwrap();
+                        }
+                    }
+                    Err(_) => {
+                        // Channel has been closed
+                        break;
+                    }
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
     // Create pages/ if it doesn't exist
     std::fs::create_dir_all("pages").unwrap();
+
+    let mut current_worker = 0;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -161,13 +192,10 @@ fn main() {
                         }
                     }
                     if let Some(pageid) = current_pageid {
-                        let html_text = request_parse(&text);
-                        if let Some(html_text) = html_text {
-                            // Output HTML to a file
-                            let file_name = format!("pages/{pageid}.html");
-                            let mut file = File::create(file_name).unwrap();
-                            file.write_all(html_text.as_bytes()).unwrap();
-                        }
+                        txs[current_worker]
+                            .send((pageid, text.to_string()))
+                            .unwrap();
+                        current_worker = (current_worker + 1) % 20; // Rotate workers
                     }
                 }
             }
@@ -179,6 +207,16 @@ fn main() {
             _ => {}
         }
         buf.clear();
+    }
+
+    // Close all channels to stop the worker threads
+    for tx in txs {
+        drop(tx);
+    }
+
+    // Wait for all worker threads to complete
+    for handle in handles {
+        handle.join().unwrap();
     }
 
     println!("Number of articles: {}", article_count);
