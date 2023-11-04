@@ -3,31 +3,6 @@
 Number of articles: 1036759
 Folder size: 1.26GB
 
-# Increase URI size limit of Apache server
-
-1. Open `/etc/apache2/apache2.conf` and insert:
-
-```
-LimitRequestLine 4294967296
-LimitRequestFieldSize 4294967296
-```
-
-Raise the URI byte size limit to 4 GiB.
-
-2. Open `/etc/apache2/sites-available/000-default.conf` and insert the same two lines:
-
-```
-LimitRequestLine 4294967296
-LimitRequestFieldSize 4294967296
-```
-
-Reference: https://stackoverflow.com/a/57246448/6798201
-
-# Start MediaWiki Server
-```
-docker-compose up
-```
-
 # Setup MediaWiki
 1. Open `localhost:8080` in your favorite browser. Click on `complete the installation` to continue.
 
@@ -79,3 +54,57 @@ Press `continue` to begin installation (should take only a second to finish).
 ```
 
 <img src="media/install-8-complete.png" style="width:600px">
+
+
+# Increase URI size limit of Apache server
+You might encounter URI too long error:
+```
+Failed to parse response JSON: expected value at line 1 column 1
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">
+<html><head>
+<title>414 Request-URI Too Long</title>
+</head><body>
+<h1>Request-URI Too Long</h1>
+<p>The requested URL's length exceeds the capacity
+limit for this server.<br />
+</p>
+<hr>
+<address>Apache/2.4.57 (Debian) Server at 172.18.0.3 Port 80</address>
+</body></html>
+```
+
+In the above case, do the following steps to enlarge the URI length limit.
+
+0. Start the MediaWiki container if you haven't already:
+```
+docker-compose up
+```
+
+1. In a new terminal, open a shell in the server:
+```
+docker-compose exec mediawiki /bin/bash
+```
+
+2. Install Nano text editor:
+```
+apt update
+apt install nano
+```
+
+3. Open apache config file by doing `nano /etc/apache2/apache2.conf` and insert:
+
+```
+LimitRequestLine 4294967296
+LimitRequestFieldSize 4294967296
+```
+
+Raise the URI byte size limit to 4 GiB.
+
+4. Open another config file by doing `nano /etc/apache2/sites-available/000-default.conf` and insert the same two lines before `</VirtualHost>`:
+
+```
+LimitRequestLine 4294967296
+LimitRequestFieldSize 4294967296
+```
+
+Reference: https://stackoverflow.com/a/57246448/6798201
