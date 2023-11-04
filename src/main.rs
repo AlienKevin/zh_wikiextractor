@@ -279,7 +279,7 @@ impl std::fmt::Display for ZhVariant {
     }
 }
 
-fn parse_articles(variant: ZhVariant) {
+fn parse_articles(variant: ZhVariant, filter: bool) {
     let file = File::open("zhwiki-latest-pages-articles.xml").unwrap();
     let file = BufReader::new(file);
     let mut reader = Reader::from_reader(file);
@@ -318,7 +318,7 @@ fn parse_articles(variant: ZhVariant) {
                     Ok((pageid, revisionid, text)) => {
                         let html_text = request_parse(&text, variant);
                         if let Some(html_text) = html_text {
-                            let cleaned_text = html_to_text(&html_text);
+                            let cleaned_text = html_to_text(&html_text, filter);
                             if !cleaned_text.is_empty() {
                                 let file_name = format!("pages/{pageid}_{revisionid}.txt");
                                 let mut file = File::create(file_name).unwrap();
