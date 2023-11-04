@@ -34,7 +34,7 @@ struct ParseResponse {
 
 fn main() {
     // write_to_parquet("zhwiki_hk.parquet").unwrap();
-    
+
     let contents = read_from_parquet(
         "zhwiki_hk.parquet",
         HashSet::from_iter([45, 550, 672, 690, 758]),
@@ -46,10 +46,11 @@ fn main() {
     }
 }
 
-fn request_parse(text: &str) -> Option<String> {
+fn request_parse(text: &str, variant: ZhVariant) -> Option<String> {
     // Base URL and parameters
     let base_url = "http://localhost:8080/api.php";
-    let text_arg = format!("text={}", text);
+    let lang = format!("uselang={variant}");
+    let text_arg = format!("text={text}");
     let curl_args = vec![
         "-X",
         "POST",
@@ -61,7 +62,7 @@ fn request_parse(text: &str) -> Option<String> {
         "--data-urlencode",
         "contentmodel=wikitext",
         "--data-urlencode",
-        "uselang=zh-hk",
+        &lang,
         "--data-urlencode",
         &text_arg,
     ];
@@ -150,7 +151,7 @@ fn clean_text(text: &str) -> String {
     text
 }
 
-fn filter_short_lines(text: &str) -> String {
+fn filter_lines(text: &str) -> String {
     let punctuation = Regex::new(r"\p{P}").unwrap();
     let han = Regex::new(r"\p{Han}").unwrap();
 
@@ -165,7 +166,7 @@ fn filter_short_lines(text: &str) -> String {
         .join("\n")
 }
 
-fn html_to_text(html: &str) -> String {
+fn html_to_text(html: &str, filter: bool) -> String {
     let mut reader = Reader::from_reader(Cursor::new(html));
     reader.trim_text(true);
 
@@ -248,12 +249,37 @@ fn html_to_text(html: &str) -> String {
 
     output = clean_text(&output);
 
-    output = filter_short_lines(&output);
+    if filter {
+        output = filter_lines(&output);
+    }
 
     output.trim().to_string()
 }
 
-fn parse_articles() {
+#[derive(Debug, Clone, Copy)]
+enum ZhVariant {
+    Cn,
+    Hk,
+    Mo,
+    My,
+    Sg,
+    Tw,
+}
+
+impl std::fmt::Display for ZhVariant {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            ZhVariant::Cn => write!(f, "zh-cn"),
+            ZhVariant::Hk => write!(f, "zh-hk"),
+            ZhVariant::Mo => write!(f, "zh-mo"),
+            ZhVariant::My => write!(f, "zh-my"),
+            ZhVariant::Sg => write!(f, "zh-sg"),
+            ZhVariant::Tw => write!(f, "zh-tw"),
+        }
+    }
+}
+
+fn parse_articles(variant: ZhVariant) {
     let file = File::open("zhwiki-latest-pages-articles.xml").unwrap();
     let file = BufReader::new(file);
     let mut reader = Reader::from_reader(file);
@@ -290,7 +316,7 @@ fn parse_articles() {
             loop {
                 match rx.recv() {
                     Ok((pageid, revisionid, text)) => {
-                        let html_text = request_parse(&text);
+                        let html_text = request_parse(&text, variant);
                         if let Some(html_text) = html_text {
                             let cleaned_text = html_to_text(&html_text);
                             if !cleaned_text.is_empty() {
