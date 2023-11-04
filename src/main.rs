@@ -258,6 +258,10 @@ fn html_to_text(html: &str, filter: bool) -> String {
     output = parenthesized_han.replace_all(&output, "（$1）").to_string();
     output = output.replace("@@start@@", "（").replace("@@end@@", "）");
 
+    // Remove section headers
+    let section_header = Regex::new(r"==.+==\s*\n?").unwrap();
+    output = section_header.replace_all(&output, "").to_string();
+
     output = clean_text(&output);
 
     if filter {
