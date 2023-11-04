@@ -57,23 +57,7 @@ Press `continue` to begin installation (should take only a second to finish).
 
 
 # Increase URI size limit of Apache server
-You might encounter URI too long error:
-```
-Failed to parse response JSON: expected value at line 1 column 1
-<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">
-<html><head>
-<title>414 Request-URI Too Long</title>
-</head><body>
-<h1>Request-URI Too Long</h1>
-<p>The requested URL's length exceeds the capacity
-limit for this server.<br />
-</p>
-<hr>
-<address>Apache/2.4.57 (Debian) Server at 172.18.0.3 Port 80</address>
-</body></html>
-```
-
-In the above case, do the following steps to enlarge the URI length limit.
+You need to increase the URI size limit to avoid URI length errors:
 
 0. Start the MediaWiki container if you haven't already:
 ```
@@ -94,8 +78,8 @@ apt install nano
 3. Open apache config file by doing `nano /etc/apache2/apache2.conf` and insert:
 
 ```
-LimitRequestLine 4294967296
-LimitRequestFieldSize 4294967296
+LimitRequestLine 1294967296
+LimitRequestFieldSize 1294967296
 ```
 
 Raise the URI byte size limit to 4 GiB.
@@ -103,8 +87,13 @@ Raise the URI byte size limit to 4 GiB.
 4. Open another config file by doing `nano /etc/apache2/sites-available/000-default.conf` and insert the same two lines before `</VirtualHost>`:
 
 ```
-LimitRequestLine 4294967296
-LimitRequestFieldSize 4294967296
+LimitRequestLine 1294967296
+LimitRequestFieldSize 1294967296
+```
+
+5. Restart apache server:
+```
+service apache2 restart
 ```
 
 Reference: https://stackoverflow.com/a/57246448/6798201
