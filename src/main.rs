@@ -1,5 +1,13 @@
+use core::num;
 use itertools::Itertools;
+use kdam::{tqdm, BarExt};
+use parquet::column::writer::ColumnWriter;
 use parquet::record::RowAccessor;
+use parquet::{
+    data_type::ByteArray,
+    file::{properties::WriterProperties, writer::SerializedFileWriter},
+    schema::parser::parse_message_type,
+};
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use regex::Regex;
@@ -9,10 +17,10 @@ use std::collections::HashSet;
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Cursor;
-use std::io::Write;
 use std::process::Command;
-use std::sync::mpsc;
-use std::thread;
+use std::sync::{mpsc, Mutex};
+use std::thread::{self};
+use std::{fs, path::Path, sync::Arc};
 
 #[derive(Debug, Deserialize)]
 struct Parse {
@@ -33,16 +41,17 @@ struct ParseResponse {
 }
 
 fn main() {
-    // write_to_parquet("zhwiki_hk.parquet").unwrap();
+    // let xml_filename = "zhwiki-latest-pages-articles.xml";
+    let xml_filename = "zhwiki-short.xml";
+    parse_articles(xml_filename, ZhVariant::Tw, false).unwrap();
 
-    let contents = read_from_parquet(
-        "zhwiki_hk.parquet",
+    let pages = read_from_parquet(
+        "wikipedia-zh-tw.parquet",
         HashSet::from_iter([45, 550, 672, 690, 758]),
     )
     .unwrap();
-    for (id, content) in contents {
-        println!("{id}");
-        println!("{content}\n");
+    for page in pages {
+        println!("{page:#?}");
     }
 }
 
@@ -63,6 +72,8 @@ fn request_parse(text: &str, variant: ZhVariant) -> Option<String> {
         "contentmodel=wikitext",
         "--data-urlencode",
         &lang,
+        // "--data-urlencode",
+        // "section=new",
         "--data-urlencode",
         &text_arg,
     ];
@@ -279,8 +290,79 @@ impl std::fmt::Display for ZhVariant {
     }
 }
 
-fn parse_articles(variant: ZhVariant, filter: bool) {
-    let file = File::open("zhwiki-latest-pages-articles.xml").unwrap();
+#[derive(Debug, Clone)]
+struct Page {
+    page_id: i64,
+    revision_id: i64,
+    timestamp: i64,
+    title: String,
+    content: String,
+}
+
+fn count_pages(xml_filename: &str) -> quick_xml::Result<usize> {
+    let file = File::open(xml_filename)?;
+    let file = BufReader::new(file);
+    let mut reader = Reader::from_reader(file);
+
+    let mut count = 0;
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) if e.name().as_ref() == b"page" => {
+                count += 1;
+            }
+            Ok(Event::Eof) => break, // Exit the loop when reaching end of file
+            Err(e) => return Err(e),
+            _ => (), // There are several other Event variants that we do not handle here
+        }
+        buf.clear();
+    }
+    Ok(count)
+}
+
+fn parse_articles(
+    xml_filename: &str,
+    variant: ZhVariant,
+    filter: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Set up Parquet writer
+    let output_name = format!("wikipedia-{}.parquet", variant);
+    let parquet_path = Path::new(output_name.as_str());
+
+    let message_type = "
+        message schema {
+            REQUIRED INT64 id;
+            REQUIRED INT64 revision_id;
+            REQUIRED INT64 timestamp (TIMESTAMP_MILLIS);
+            REQUIRED BINARY title (UTF8);
+            REQUIRED BINARY content (UTF8);
+        }
+    ";
+    let schema = Arc::new(parse_message_type(message_type)?);
+
+    // Writer properties to enable compression
+    let props = WriterProperties::builder()
+        // Change the compression type if needed, SNAPPY is a default good choice for a balance between size and speed
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .build();
+
+    let file = fs::File::create(&parquet_path)?;
+    let writer = Arc::new(Mutex::new(SerializedFileWriter::new(
+        file,
+        schema,
+        Arc::new(props),
+    )?));
+
+    // Initialize batch vectors
+    let pages = Arc::new(Mutex::new(vec![]));
+    let batch_size = 1000;
+
+    let num_pages = count_pages(xml_filename)?;
+    // Initialize progress bar
+    let progress_bar = Arc::new(Mutex::new(tqdm!(total = num_pages)));
+
+    // Read XML file
+    let file = File::open(xml_filename).unwrap();
     let file = BufReader::new(file);
     let mut reader = Reader::from_reader(file);
     let mut buf = Vec::new();
@@ -288,12 +370,17 @@ fn parse_articles(variant: ZhVariant, filter: bool) {
     let mut inside_page = false;
     let mut inside_ns = false;
     let mut inside_id = false;
-    let mut inside_revision = true;
+    let mut inside_revision = false;
+    let mut inside_title = false;
     let mut inside_text = false;
+    let mut inside_timestamp = false;
+
     let mut is_article = false;
     let mut article_count = 0;
-    let mut current_pageid: Option<u64> = None;
-    let mut current_revisionid: Option<u64> = None;
+    let mut current_pageid: Option<i64> = None;
+    let mut current_revisionid: Option<i64> = None;
+    let mut current_timestamp: Option<i64> = None;
+    let mut current_title: Option<String> = None;
 
     let mut variants: HashMap<String, usize> = HashMap::from_iter(vec![
         ("zh-hans".to_string(), 0),
@@ -310,19 +397,49 @@ fn parse_articles(variant: ZhVariant, filter: bool) {
     let mut handles = vec![];
     let mut txs = vec![];
     for _ in 0..20 {
-        let (tx, rx) = mpsc::channel::<(u64, u64, String)>();
+        let (tx, rx) = mpsc::channel::<Page>();
         txs.push(tx);
+        let pages = pages.clone();
+        let writer = writer.clone();
+        let progress_bar = progress_bar.clone();
         let handle = thread::spawn(move || {
             loop {
                 match rx.recv() {
-                    Ok((pageid, revisionid, text)) => {
-                        let html_text = request_parse(&text, variant);
-                        if let Some(html_text) = html_text {
-                            let cleaned_text = html_to_text(&html_text, filter);
-                            if !cleaned_text.is_empty() {
-                                let file_name = format!("pages/{pageid}_{revisionid}.txt");
-                                let mut file = File::create(file_name).unwrap();
-                                file.write_all(cleaned_text.as_bytes()).unwrap();
+                    Ok(Page {
+                        page_id: pageid,
+                        revision_id: revisionid,
+                        timestamp,
+                        title,
+                        content: text,
+                    }) => {
+                        let html_title = request_parse(&title, variant);
+                        if let Some(html_title) = html_title {
+                            let title = html_to_text(&html_title, false);
+                            if !title.is_empty() {
+                                let html_text = request_parse(&text, variant);
+                                if let Some(html_text) = html_text {
+                                    println!("{html_text}");
+                                    let cleaned_text = html_to_text(&html_text, filter);
+                                    if !cleaned_text.is_empty() {
+                                        // Add to batch vectors
+                                        let mut pages = pages.lock().unwrap();
+                                        pages.push(Page {
+                                            page_id: pageid,
+                                            revision_id: revisionid,
+                                            timestamp,
+                                            title,
+                                            content: cleaned_text,
+                                        });
+                                        progress_bar.lock().unwrap().update(1).unwrap();
+
+                                        // Write batch if it reaches the batch size
+                                        if pages.len() >= batch_size {
+                                            let mut writer = writer.lock().unwrap();
+                                            write_batch(&mut writer, &pages).unwrap();
+                                            pages.clear();
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -336,9 +453,6 @@ fn parse_articles(variant: ZhVariant, filter: bool) {
         handles.push(handle);
     }
 
-    // Create pages/ if it doesn't exist
-    std::fs::create_dir_all("pages").unwrap();
-
     let mut current_worker = 0;
 
     loop {
@@ -351,16 +465,10 @@ fn parse_articles(variant: ZhVariant, filter: bool) {
                     }
                     b"ns" => inside_ns = true,
                     b"text" => inside_text = true,
-                    b"id" => {
-                        if inside_page {
-                            inside_id = true;
-                        }
-                    }
-                    b"revision" => {
-                        if inside_page {
-                            inside_revision = true;
-                        }
-                    }
+                    b"id" => inside_id = true,
+                    b"revision" => inside_revision = true,
+                    b"title" => inside_title = true,
+                    b"timestamp" => inside_timestamp = true,
                     _ => {}
                 }
             }
@@ -389,37 +497,62 @@ fn parse_articles(variant: ZhVariant, filter: bool) {
                 b"revision" => {
                     inside_revision = false;
                 }
+                b"timestamp" => {
+                    inside_timestamp = false;
+                }
+                b"title" => {
+                    inside_title = false;
+                }
                 _ => {}
             },
             Ok(Event::Text(e)) => {
-                if inside_page && inside_ns {
-                    let ns = e.unescape().unwrap();
-                    if ns != "0" {
-                        is_article = false; // It's not a main content page
-                    }
-                }
-                if inside_page && inside_id {
-                    if let Ok(id) = e.unescape().unwrap().parse::<u64>() {
-                        if inside_revision {
-                            current_revisionid = Some(id);
-                        } else {
-                            current_pageid = Some(id);
+                if inside_page {
+                    if inside_ns {
+                        let ns = e.unescape().unwrap();
+                        if ns != "0" {
+                            is_article = false; // It's not a main content page
                         }
-                    }
-                }
-                if inside_page && is_article && inside_text {
-                    let text = e.unescape().unwrap();
-                    for (variant, count) in &mut variants {
-                        if text.contains(&format!("{variant}:")) {
-                            *count += 1;
+                    } else if inside_id {
+                        if let Ok(id) = e.unescape().unwrap().parse::<i64>() {
+                            if inside_revision {
+                                current_revisionid = Some(id);
+                            } else {
+                                current_pageid = Some(id);
+                            }
                         }
-                    }
-                    if let Some(pageid) = current_pageid {
-                        if let Some(revisionid) = current_revisionid {
-                            txs[current_worker]
-                                .send((pageid, revisionid, text.to_string()))
-                                .unwrap();
-                            current_worker = (current_worker + 1) % 20; // Rotate workers
+                    } else if inside_revision && inside_timestamp {
+                        let timestamp_str = e.unescape().unwrap();
+                        let timestamp = chrono::NaiveDateTime::parse_from_str(&timestamp_str, "%+")
+                            .map_err(|e| format!("Failed to parse timestamp: {}", e))?;
+                        let timestamp_millis = timestamp.timestamp_millis();
+                        current_timestamp = Some(timestamp_millis);
+                    } else if inside_title {
+                        current_title = Some(e.unescape().unwrap().to_string());
+                    } else if is_article && inside_text {
+                        let text = e.unescape().unwrap();
+                        for (variant, count) in &mut variants {
+                            if text.contains(&format!("{variant}:")) {
+                                *count += 1;
+                            }
+                        }
+                        if let Some(pageid) = current_pageid {
+                            if let Some(revisionid) = current_revisionid {
+                                if let Some(timestamp) = current_timestamp.as_ref() {
+                                    if let Some(title) = current_title.as_ref() {
+                                        txs[current_worker]
+                                            .send(Page {
+                                                page_id: pageid,
+                                                revision_id: revisionid,
+                                                timestamp: *timestamp,
+                                                title: title.to_string(),
+                                                content: text.to_string(),
+                                            })
+                                            .unwrap();
+                                        current_worker = (current_worker + 1) % 20;
+                                        // Rotate workers
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -444,159 +577,117 @@ fn parse_articles(variant: ZhVariant, filter: bool) {
         handle.join().unwrap();
     }
 
+    // Write any remaining items in the batch vectors
+    let pages = pages.lock().unwrap();
+    if !pages.is_empty() {
+        write_batch(&mut writer.lock().unwrap(), &pages)?;
+    }
+
+    Arc::try_unwrap(writer)
+        .unwrap()
+        .into_inner()
+        .unwrap()
+        .close()?;
+
     println!("Number of articles: {}", article_count);
     for (variant, count) in variants {
         println!("{}: {}", variant, count);
     }
+
+    Ok(())
 }
 
-fn get_pages_stats() {
-    // Specify the path to the folder
-    let path = "pages/"; // Replace this with the path to the folder you're interested in
+fn write_batch(
+    writer: &mut SerializedFileWriter<File>,
+    pages: &[Page],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut row_group_writer = writer.next_row_group()?;
 
-    let mut num_files = 0;
-    let mut folder_size = 0;
-
-    // Read the directory
-    match std::fs::read_dir(path) {
-        Ok(entries) => {
-            for entry in entries {
-                match entry {
-                    Ok(entry) => {
-                        let path = entry.path();
-                        if path.is_file() {
-                            // println!("File: {}", path.display());
-                            num_files += 1;
-                            folder_size += entry.metadata().unwrap().len();
-                        } else if path.is_dir() {
-                            println!("Dir: {}", path.display());
-                        }
-                    }
-                    Err(_) => println!("Error reading entry"),
-                }
-            }
+    // Write ID column
+    if let Some(mut col_writer) = row_group_writer.next_column()? {
+        if let ColumnWriter::Int64ColumnWriter(ref mut writer) = col_writer.untyped() {
+            writer.write_batch(
+                &pages
+                    .iter()
+                    .map(|Page { page_id, .. }| *page_id)
+                    .collect::<Vec<_>>(),
+                None,
+                None,
+            )?;
         }
-        Err(_) => println!("Error reading directory"),
+        col_writer.close()?;
     }
 
-    println!("Number of files: {num_files}");
-    println!("Folder size: {folder_size} bytes");
-}
-
-fn write_to_parquet(output_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use kdam::tqdm;
-    use parquet::column::writer::ColumnWriter;
-    use parquet::{
-        data_type::ByteArray,
-        file::{properties::WriterProperties, writer::SerializedFileWriter},
-        schema::parser::parse_message_type,
-    };
-    use std::{fs, path::Path, sync::Arc};
-
-    let parquet_path = Path::new(output_name);
-
-    let message_type = "
-        message schema {
-            REQUIRED INT64 id;
-            REQUIRED INT64 revision_id;
-            REQUIRED BINARY content (UTF8);
+    // Write Revision ID column
+    if let Some(mut col_writer) = row_group_writer.next_column()? {
+        if let ColumnWriter::Int64ColumnWriter(ref mut writer) = col_writer.untyped() {
+            writer.write_batch(
+                &pages
+                    .iter()
+                    .map(|Page { revision_id, .. }| *revision_id)
+                    .collect::<Vec<_>>(),
+                None,
+                None,
+            )?;
         }
-    ";
-    let schema = Arc::new(parse_message_type(message_type)?);
-
-    // Writer properties to enable compression
-    let props = WriterProperties::builder()
-        // Change the compression type if needed, SNAPPY is a default good choice for a balance between size and speed
-        .set_compression(parquet::basic::Compression::SNAPPY)
-        .build();
-
-    let file = fs::File::create(&parquet_path)?;
-    let mut writer = SerializedFileWriter::new(file, schema, Arc::new(props))?;
-
-    let paths = fs::read_dir("pages/")?;
-
-    // Initialize batch vectors
-    let mut ids = Vec::new();
-    let mut revision_ids = Vec::new();
-    let mut contents = Vec::new();
-    let batch_size = 1000;
-
-    fn write_batch(
-        writer: &mut SerializedFileWriter<File>,
-        ids: &[i64],
-        revision_ids: &[i64],
-        contents: &[ByteArray],
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut row_group_writer = writer.next_row_group()?;
-
-        // Write ID column
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            if let ColumnWriter::Int64ColumnWriter(ref mut writer) = col_writer.untyped() {
-                writer.write_batch(ids, None, None)?;
-            }
-            col_writer.close()?;
-        }
-
-        // Write Revision ID column
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            if let ColumnWriter::Int64ColumnWriter(ref mut writer) = col_writer.untyped() {
-                writer.write_batch(revision_ids, None, None)?;
-            }
-            col_writer.close()?;
-        }
-
-        // Write Content column
-        if let Some(mut col_writer) = row_group_writer.next_column()? {
-            if let ColumnWriter::ByteArrayColumnWriter(ref mut writer) = col_writer.untyped() {
-                writer.write_batch(contents, None, None)?;
-            }
-            col_writer.close()?;
-        }
-
-        row_group_writer.close()?;
-        Ok(())
+        col_writer.close()?;
     }
 
-    for path in tqdm!(paths) {
-        let path = path?.path();
-        let file_name = path.file_name().unwrap().to_str().unwrap();
-
-        if let Some((id_str, revision_id_str)) = file_name.split_once('_') {
-            let id = id_str.parse::<i64>()?;
-            let revision_id = revision_id_str.split('.').next().unwrap().parse::<i64>()?;
-            let content = std::fs::read_to_string(&path)?;
-
-            // Add to batch vectors
-            ids.push(id);
-            revision_ids.push(revision_id);
-            contents.push(ByteArray::from(content.as_str()));
-
-            // Write batch if it reaches the batch size
-            if ids.len() >= batch_size {
-                write_batch(&mut writer, &ids, &revision_ids, &contents)?;
-                ids.clear();
-                revision_ids.clear();
-                contents.clear();
-            }
+    // Write Timestamp column
+    if let Some(mut col_writer) = row_group_writer.next_column()? {
+        if let ColumnWriter::Int64ColumnWriter(ref mut writer) = col_writer.untyped() {
+            writer.write_batch(
+                &pages
+                    .iter()
+                    .map(|Page { timestamp, .. }| *timestamp)
+                    .collect::<Vec<_>>(),
+                None,
+                None,
+            )?;
         }
+        col_writer.close()?;
     }
 
-    // Write any remaining items in the batch vectors
-    if !ids.is_empty() {
-        write_batch(&mut writer, &ids, &revision_ids, &contents)?;
+    // Write Title column
+    if let Some(mut col_writer) = row_group_writer.next_column()? {
+        if let ColumnWriter::ByteArrayColumnWriter(ref mut writer) = col_writer.untyped() {
+            writer.write_batch(
+                &pages
+                    .iter()
+                    .map(|Page { title, .. }| ByteArray::from(title.as_str()))
+                    .collect::<Vec<_>>(),
+                None,
+                None,
+            )?;
+        }
+        col_writer.close()?;
     }
 
-    writer.close()?;
+    // Write Content column
+    if let Some(mut col_writer) = row_group_writer.next_column()? {
+        if let ColumnWriter::ByteArrayColumnWriter(ref mut writer) = col_writer.untyped() {
+            writer.write_batch(
+                &pages
+                    .iter()
+                    .map(|Page { content, .. }| ByteArray::from(content.as_str()))
+                    .collect::<Vec<_>>(),
+                None,
+                None,
+            )?;
+        }
+        col_writer.close()?;
+    }
+
+    row_group_writer.close()?;
     Ok(())
 }
 
 fn read_from_parquet(
     input_name: &str,
     ids: HashSet<i64>,
-) -> Result<HashMap<i64, String>, Box<dyn std::error::Error>> {
+) -> Result<Vec<Page>, Box<dyn std::error::Error>> {
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::SerializedFileReader;
-    use std::path::Path;
 
     // Define the path for the Parquet file.
     let parquet_path = Path::new(input_name);
@@ -612,18 +703,26 @@ fn read_from_parquet(
     // Create an iterator to read row groups.
     let iter = reader.get_row_iter(Some(schema.clone()))?;
 
-    let mut contents = HashMap::new();
+    let mut pages = vec![];
 
     // Print the first 10 rows.
     for row in iter {
         let row = row?;
-        let id: i64 = row.get_long(0).unwrap();
-        if ids.contains(&id) {
-            // let revision_id: i64 = row?.get_long(1).unwrap();
-            let content: &str = row.get_string(2).unwrap();
-            contents.insert(id, content.to_string());
+        let page_id: i64 = row.get_long(0).unwrap();
+        if ids.contains(&page_id) {
+            let revision_id: i64 = row.get_long(1).unwrap();
+            let timestamp_millis: i64 = row.get_timestamp_millis(2).unwrap();
+            let title: &str = row.get_string(3).unwrap();
+            let content: &str = row.get_string(4).unwrap();
+            pages.push(Page {
+                page_id,
+                revision_id,
+                timestamp: timestamp_millis,
+                title: title.to_string(),
+                content: content.to_string(),
+            });
         }
     }
 
-    Ok(contents)
+    Ok(pages)
 }
