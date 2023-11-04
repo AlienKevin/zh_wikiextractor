@@ -2,6 +2,7 @@ use core::num;
 use itertools::Itertools;
 use kdam::{tqdm, BarExt};
 use parquet::column::writer::ColumnWriter;
+use parquet::data_type::AsBytes;
 use parquet::record::RowAccessor;
 use parquet::{
     data_type::ByteArray,
@@ -15,8 +16,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::BufReader;
-use std::io::Cursor;
+use std::io::{BufReader, BufWriter};
+use std::io::{Cursor, Write};
 use std::process::Command;
 use std::sync::{mpsc, Mutex};
 use std::thread::{self};
@@ -40,19 +41,20 @@ struct ParseResponse {
     parse: Parse,
 }
 
+const MEDIAWIKI_XML_HEADER: &[u8; 252] = br###"<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.10/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.mediawiki.org/xml/export-0.10/ http://www.mediawiki.org/xml/export-0.10.xsd" version="0.10" xml:lang="zh">"###;
+
 fn main() {
     // let xml_filename = "zhwiki-latest-pages-articles.xml";
     let xml_filename = "zhwiki-short.xml";
-    parse_articles(xml_filename, ZhVariant::Tw, false).unwrap();
+    // extract_templates(xml_filename, "data/zhwiki-templates.xml").unwrap();
+    split_templates("data/zhwiki-templates.xml").unwrap();
+    // parse_articles(xml_filename, ZhVariant::Tw, false).unwrap();
 
-    let pages = read_from_parquet(
-        "wikipedia-zh-tw.parquet",
-        HashSet::from_iter([45, 550, 672, 690, 758]),
-    )
-    .unwrap();
-    for page in pages {
-        println!("{page:#?}");
-    }
+    // // ids = HashSet::from_iter([45, 550, 672, 690, 758])
+    // let pages = read_from_parquet("wikipedia-zh-tw.parquet", None).unwrap();
+    // for page in pages {
+    //     println!("{page:#?}");
+    // }
 }
 
 fn request_parse(text: &str, variant: ZhVariant) -> Option<String> {
@@ -301,7 +303,162 @@ struct Page {
     content: String,
 }
 
-fn count_pages(xml_filename: &str) -> quick_xml::Result<usize> {
+fn split_templates(templates_filename: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let num_pages = count_pages(templates_filename, false)?;
+    let pages_per_file = (num_pages as f32 / 10.0).ceil() as usize; // Calculate how many pages per file, always rounding up
+    println!("pages_per_file: {pages_per_file}");
+
+    let mut reader = Reader::from_file(templates_filename)?;
+    reader.trim_text(true);
+
+    let mut buf = Vec::new();
+    let mut file_count = 0;
+    let mut page_count = 0;
+    let mut writer = BufWriter::new(File::create(format!(
+        "data/zhwiki-templates-split-{}.xml",
+        file_count
+    ))?);
+
+    // The header for the first file is included in the source template file
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) if e.name().as_ref() == b"page" => {
+                if page_count == pages_per_file {
+                    // Close the current file and start a new one
+                    writer.write_all(b"</mediawiki>")?;
+                    writer.flush()?;
+                    file_count += 1;
+                    page_count = 0;
+
+                    writer = BufWriter::new(File::create(format!(
+                        "data/zhwiki-templates-split-{}.xml",
+                        file_count
+                    ))?);
+                    writer.write_all(MEDIAWIKI_XML_HEADER)?;
+                }
+
+                writer.write_all(b"<page>")?;
+                page_count += 1;
+            }
+            Ok(Event::Text(e)) => {
+                writer.write_all(e.as_bytes())?;
+            }
+            Ok(Event::Start(ref e)) => {
+                writer.write_all(b"<")?;
+                writer.write_all(e.as_bytes())?;
+                writer.write_all(b">")?;
+            }
+            Ok(Event::Empty(ref e)) => {
+                writer.write_all(b"<")?;
+                writer.write_all(e.as_bytes())?;
+                writer.write_all(b"/>")?;
+            }
+            Ok(Event::End(ref e)) => {
+                writer.write_all(b"</")?;
+                writer.write_all(e.as_bytes())?;
+                writer.write_all(b">")?;
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(From::from(e)),
+            _ => (),
+        }
+
+        buf.clear();
+    }
+
+    // Close the root element
+    writer.write_all(b"</mediawiki>")?;
+    writer.flush()?;
+
+    Ok(())
+}
+
+fn extract_templates(xml_filename: &str, output_filename: &str) -> quick_xml::Result<()> {
+    let file = File::open(xml_filename)?;
+    let file = BufReader::new(file);
+    let mut reader = Reader::from_reader(file);
+    let output = File::create(output_filename)?;
+    let mut writer = BufWriter::new(output);
+
+    let mut buf = Vec::new();
+    let mut page_buf = Vec::new(); // Buffer to store page elements
+    let mut is_template = false;
+    let mut inside_page = false;
+    let mut inside_title = false;
+
+    // Write XML declaration to the output file
+    writer.write_all(MEDIAWIKI_XML_HEADER)?;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) if e.name().as_ref() == b"page" => {
+                // Start buffering page elements
+                inside_page = true;
+                // Clear buffer for a new page
+                page_buf.clear();
+                // Also write the <page> start tag into the buffer
+                page_buf.extend_from_slice(b"<page>");
+            }
+            Ok(Event::End(ref e)) if e.name().as_ref() == b"page" => {
+                // End of the page element
+                inside_page = false;
+                // Also write the </page> end tag into the buffer
+                page_buf.extend_from_slice(b"</page>");
+                // If it's a template, write the buffered page to the output
+                if is_template {
+                    writer.write_all(&page_buf)?;
+                }
+                // Reset the flag for the next page
+                is_template = false;
+            }
+            Ok(Event::Text(ref e)) if inside_page => {
+                if inside_title {
+                    let title = e.unescape().unwrap();
+                    if title.starts_with("Template:") {
+                        is_template = true;
+                    }
+                }
+                // Buffer text events only when inside a page
+                page_buf.extend(e.iter());
+            }
+            Ok(Event::Start(ref e)) if inside_page => {
+                if e.name().as_ref() == b"title" {
+                    inside_title = true;
+                }
+                // Buffer start or empty events only when inside a page
+                page_buf.extend(b"<");
+                page_buf.extend(e.iter());
+                page_buf.extend(b">");
+            }
+            Ok(Event::Empty(ref e)) if inside_page => {
+                // Buffer start or empty events only when inside a page
+                page_buf.extend(b"<");
+                page_buf.extend(e.iter());
+                page_buf.extend(b"/>");
+            }
+            Ok(Event::End(ref e)) if inside_page => {
+                if e.name().as_ref() == b"title" {
+                    inside_title = false;
+                }
+                // Buffer end events only when inside a page
+                page_buf.extend(b"</");
+                page_buf.extend(e.iter());
+                page_buf.extend(b">");
+            }
+            Ok(Event::Eof) => break, // Exit the loop when reaching end of file
+            Err(e) => return Err(e),
+            _ => {} // Ignore other events
+        }
+    }
+
+    // Write XML closing tag
+    writer.write_all(b"</mediawiki>")?;
+
+    Ok(())
+}
+
+fn count_pages(xml_filename: &str, only_articles: bool) -> quick_xml::Result<usize> {
     let file = File::open(xml_filename)?;
     let file = BufReader::new(file);
     let mut reader = Reader::from_reader(file);
@@ -320,7 +477,7 @@ fn count_pages(xml_filename: &str) -> quick_xml::Result<usize> {
             },
             Ok(Event::End(ref e)) => match e.name().as_ref() {
                 b"page" => {
-                    if is_article {
+                    if !only_articles || is_article {
                         count += 1;
                     }
                     // reset flag
@@ -389,7 +546,7 @@ fn parse_articles(
     let pages = Arc::new(Mutex::new(vec![]));
     let batch_size = 1000;
 
-    let num_pages = count_pages(xml_filename)?;
+    let num_pages = count_pages(xml_filename, true)?;
     // Initialize progress bar
     let progress_bar = Arc::new(Mutex::new(tqdm!(total = num_pages)));
 
@@ -450,6 +607,7 @@ fn parse_articles(
                             if !title.is_empty() {
                                 let html_text = request_parse(&text, variant);
                                 if let Some(html_text) = html_text {
+                                    println!("{html_text}");
                                     let cleaned_text = html_to_text(&html_text, filter);
                                     if !cleaned_text.is_empty() {
                                         // Add to batch vectors
@@ -715,7 +873,7 @@ fn write_batch(
 
 fn read_from_parquet(
     input_name: &str,
-    ids: HashSet<i64>,
+    ids: Option<HashSet<i64>>,
 ) -> Result<Vec<Page>, Box<dyn std::error::Error>> {
     use parquet::file::reader::FileReader;
     use parquet::file::serialized_reader::SerializedFileReader;
@@ -740,7 +898,10 @@ fn read_from_parquet(
     for row in iter {
         let row = row?;
         let page_id: i64 = row.get_long(0).unwrap();
-        if ids.contains(&page_id) {
+        if match ids {
+            Some(ref ids) => ids.contains(&page_id),
+            None => true,
+        } {
             let revision_id: i64 = row.get_long(1).unwrap();
             let timestamp_millis: i64 = row.get_timestamp_millis(2).unwrap();
             let title: &str = row.get_string(3).unwrap();
