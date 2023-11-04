@@ -1,4 +1,5 @@
 use itertools::Itertools;
+use parquet::record::RowAccessor;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use regex::Regex;
@@ -29,6 +30,19 @@ struct Text {
 #[derive(Debug, Deserialize)]
 struct ParseResponse {
     parse: Parse,
+}
+
+fn main() {
+    // write_to_parquet("zhwiki_hk.parquet").unwrap();
+    let contents = read_from_parquet(
+        "zhwiki_hk.parquet",
+        HashSet::from_iter([45, 550, 672, 690, 758]),
+    )
+    .unwrap();
+    for (id, content) in contents {
+        println!("{id}");
+        println!("{content}\n");
+    }
 }
 
 fn request_parse(text: &str) -> Option<String> {
@@ -238,7 +252,7 @@ fn html_to_text(html: &str) -> String {
     output.trim().to_string()
 }
 
-fn main() {
+fn parse_articles() {
     let file = File::open("zhwiki-latest-pages-articles.xml").unwrap();
     let file = BufReader::new(file);
     let mut reader = Reader::from_reader(file);
@@ -440,4 +454,115 @@ fn get_pages_stats() {
 
     println!("Number of files: {num_files}");
     println!("Folder size: {folder_size} bytes");
+}
+
+fn write_to_parquet(output_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use kdam::tqdm;
+    use parquet::column::writer::ColumnWriter;
+    use parquet::{
+        data_type::ByteArray, file::writer::SerializedFileWriter,
+        schema::parser::parse_message_type,
+    };
+    use std::{fs, path::Path, sync::Arc};
+
+    // Define the path for the Parquet file.
+    let parquet_path = Path::new(output_name);
+
+    // Define the Parquet schema with INT64 for id and revision_id.
+    let message_type = "
+        message schema {
+            REQUIRED INT64 id;
+            REQUIRED INT64 revision_id;
+            REQUIRED BINARY content (UTF8);
+        }
+    ";
+    let schema = Arc::new(parse_message_type(message_type)?);
+
+    // Create a file for the Parquet writer.
+    let file = fs::File::create(&parquet_path)?;
+
+    // Initialize the Parquet writer.
+    let mut writer = SerializedFileWriter::new(file, schema, Default::default())?;
+
+    // Read text files from the `pages/` folder.
+    let paths = fs::read_dir("pages/")?;
+
+    for path in tqdm!(paths) {
+        let path = path?.path();
+        let file_name = path.file_name().unwrap().to_str().unwrap();
+
+        // Parse the filename to extract `id` and `revision_id`.
+        if let Some((id_str, revision_id_str)) = file_name.split_once('_') {
+            let id = id_str.parse::<i64>()?;
+            let revision_id = revision_id_str.split('.').next().unwrap().parse::<i64>()?;
+
+            // Read the contents of the text file.
+            let content = std::fs::read_to_string(&path)?;
+
+            // Write the data to the Parquet file.
+            let mut row_group_writer = writer.next_row_group()?;
+            let mut col_index: usize = 0; // Keep track of which column we are writing to
+            while let Some(mut col_writer) = row_group_writer.next_column()? {
+                match (col_index, col_writer.untyped()) {
+                    (0, ColumnWriter::Int64ColumnWriter(ref mut typed_writer)) => {
+                        typed_writer.write_batch(&[id], None, None)?;
+                    }
+                    (1, ColumnWriter::Int64ColumnWriter(ref mut typed_writer)) => {
+                        typed_writer.write_batch(&[revision_id], None, None)?;
+                    }
+                    (2, ColumnWriter::ByteArrayColumnWriter(ref mut typed_writer)) => {
+                        let byte_array = ByteArray::from(content.as_str());
+                        typed_writer.write_batch(&[byte_array], None, None)?;
+                    }
+                    _ => {
+                        panic!("Schema mismatch or unexpected column index {col_index}")
+                    }
+                }
+                col_writer.close()?;
+                col_index += 1;
+            }
+            row_group_writer.close()?;
+        }
+    }
+
+    writer.close()?;
+    Ok(())
+}
+
+fn read_from_parquet(
+    input_name: &str,
+    ids: HashSet<i64>,
+) -> Result<HashMap<i64, String>, Box<dyn std::error::Error>> {
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
+    use std::path::Path;
+
+    // Define the path for the Parquet file.
+    let parquet_path = Path::new(input_name);
+
+    // Open the Parquet file.
+    let file = File::open(&parquet_path)?;
+    let reader = SerializedFileReader::new(file)?;
+
+    // Get the Parquet file metadata.
+    let metadata = reader.metadata();
+    let schema = metadata.file_metadata().schema();
+
+    // Create an iterator to read row groups.
+    let iter = reader.get_row_iter(Some(schema.clone()))?;
+
+    let mut contents = HashMap::new();
+
+    // Print the first 10 rows.
+    for row in iter {
+        let row = row?;
+        let id: i64 = row.get_long(0).unwrap();
+        if ids.contains(&id) {
+            // let revision_id: i64 = row?.get_long(1).unwrap();
+            let content: &str = row.get_string(2).unwrap();
+            contents.insert(id, content.to_string());
+        }
+    }
+
+    Ok(contents)
 }
