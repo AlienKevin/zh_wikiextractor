@@ -34,6 +34,7 @@ struct ParseResponse {
 
 fn main() {
     // write_to_parquet("zhwiki_hk.parquet").unwrap();
+    
     let contents = read_from_parquet(
         "zhwiki_hk.parquet",
         HashSet::from_iter([45, 550, 672, 690, 758]),
@@ -460,15 +461,14 @@ fn write_to_parquet(output_name: &str) -> Result<(), Box<dyn std::error::Error>>
     use kdam::tqdm;
     use parquet::column::writer::ColumnWriter;
     use parquet::{
-        data_type::ByteArray, file::writer::SerializedFileWriter,
+        data_type::ByteArray,
+        file::{properties::WriterProperties, writer::SerializedFileWriter},
         schema::parser::parse_message_type,
     };
     use std::{fs, path::Path, sync::Arc};
 
-    // Define the path for the Parquet file.
     let parquet_path = Path::new(output_name);
 
-    // Define the Parquet schema with INT64 for id and revision_id.
     let message_type = "
         message schema {
             REQUIRED INT64 id;
@@ -478,51 +478,86 @@ fn write_to_parquet(output_name: &str) -> Result<(), Box<dyn std::error::Error>>
     ";
     let schema = Arc::new(parse_message_type(message_type)?);
 
-    // Create a file for the Parquet writer.
+    // Writer properties to enable compression
+    let props = WriterProperties::builder()
+        // Change the compression type if needed, SNAPPY is a default good choice for a balance between size and speed
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .build();
+
     let file = fs::File::create(&parquet_path)?;
+    let mut writer = SerializedFileWriter::new(file, schema, Arc::new(props))?;
 
-    // Initialize the Parquet writer.
-    let mut writer = SerializedFileWriter::new(file, schema, Default::default())?;
-
-    // Read text files from the `pages/` folder.
     let paths = fs::read_dir("pages/")?;
+
+    // Initialize batch vectors
+    let mut ids = Vec::new();
+    let mut revision_ids = Vec::new();
+    let mut contents = Vec::new();
+    let batch_size = 1000;
+
+    fn write_batch(
+        writer: &mut SerializedFileWriter<File>,
+        ids: &[i64],
+        revision_ids: &[i64],
+        contents: &[ByteArray],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut row_group_writer = writer.next_row_group()?;
+
+        // Write ID column
+        if let Some(mut col_writer) = row_group_writer.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(ref mut writer) = col_writer.untyped() {
+                writer.write_batch(ids, None, None)?;
+            }
+            col_writer.close()?;
+        }
+
+        // Write Revision ID column
+        if let Some(mut col_writer) = row_group_writer.next_column()? {
+            if let ColumnWriter::Int64ColumnWriter(ref mut writer) = col_writer.untyped() {
+                writer.write_batch(revision_ids, None, None)?;
+            }
+            col_writer.close()?;
+        }
+
+        // Write Content column
+        if let Some(mut col_writer) = row_group_writer.next_column()? {
+            if let ColumnWriter::ByteArrayColumnWriter(ref mut writer) = col_writer.untyped() {
+                writer.write_batch(contents, None, None)?;
+            }
+            col_writer.close()?;
+        }
+
+        row_group_writer.close()?;
+        Ok(())
+    }
 
     for path in tqdm!(paths) {
         let path = path?.path();
         let file_name = path.file_name().unwrap().to_str().unwrap();
 
-        // Parse the filename to extract `id` and `revision_id`.
         if let Some((id_str, revision_id_str)) = file_name.split_once('_') {
             let id = id_str.parse::<i64>()?;
             let revision_id = revision_id_str.split('.').next().unwrap().parse::<i64>()?;
-
-            // Read the contents of the text file.
             let content = std::fs::read_to_string(&path)?;
 
-            // Write the data to the Parquet file.
-            let mut row_group_writer = writer.next_row_group()?;
-            let mut col_index: usize = 0; // Keep track of which column we are writing to
-            while let Some(mut col_writer) = row_group_writer.next_column()? {
-                match (col_index, col_writer.untyped()) {
-                    (0, ColumnWriter::Int64ColumnWriter(ref mut typed_writer)) => {
-                        typed_writer.write_batch(&[id], None, None)?;
-                    }
-                    (1, ColumnWriter::Int64ColumnWriter(ref mut typed_writer)) => {
-                        typed_writer.write_batch(&[revision_id], None, None)?;
-                    }
-                    (2, ColumnWriter::ByteArrayColumnWriter(ref mut typed_writer)) => {
-                        let byte_array = ByteArray::from(content.as_str());
-                        typed_writer.write_batch(&[byte_array], None, None)?;
-                    }
-                    _ => {
-                        panic!("Schema mismatch or unexpected column index {col_index}")
-                    }
-                }
-                col_writer.close()?;
-                col_index += 1;
+            // Add to batch vectors
+            ids.push(id);
+            revision_ids.push(revision_id);
+            contents.push(ByteArray::from(content.as_str()));
+
+            // Write batch if it reaches the batch size
+            if ids.len() >= batch_size {
+                write_batch(&mut writer, &ids, &revision_ids, &contents)?;
+                ids.clear();
+                revision_ids.clear();
+                contents.clear();
             }
-            row_group_writer.close()?;
         }
+    }
+
+    // Write any remaining items in the batch vectors
+    if !ids.is_empty() {
+        write_batch(&mut writer, &ids, &revision_ids, &contents)?;
     }
 
     writer.close()?;
