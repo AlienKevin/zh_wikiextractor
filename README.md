@@ -97,3 +97,25 @@ service apache2 restart
 ```
 
 Reference: https://stackoverflow.com/a/57246448/6798201
+
+# Extract & Import Templates
+
+0. Start the MediaWiki container if you haven't already:
+```
+docker-compose up
+```
+
+1. In a new terminal, open a shell in the server:
+```
+docker-compose exec mediawiki /bin/bash
+```
+
+2. Navigate to the maintenance directory
+```
+cd /var/www/html/maintenance
+```
+
+3. Import templates on 10 threads
+```
+for n in {0..10}; do php importDump.php "/var/www/data/zhwiki-templates-split-$n.xml" & done; wait
+```

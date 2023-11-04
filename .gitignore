@@ -5,3 +5,4 @@ pages/
 htmls/
 .DS_Store
 *.parquet
+data/
