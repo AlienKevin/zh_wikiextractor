@@ -72,8 +72,6 @@ fn request_parse(text: &str, variant: ZhVariant) -> Option<String> {
         "contentmodel=wikitext",
         "--data-urlencode",
         &lang,
-        // "--data-urlencode",
-        // "section=new",
         "--data-urlencode",
         &text_arg,
     ];
@@ -310,12 +308,42 @@ fn count_pages(xml_filename: &str) -> quick_xml::Result<usize> {
 
     let mut count = 0;
     let mut buf = Vec::new();
+    let mut is_article = true;
+    let mut inside_ns = false;
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) if e.name().as_ref() == b"page" => {
-                count += 1;
+            Ok(Event::Start(ref e)) => match e.name().as_ref() {
+                b"ns" => {
+                    inside_ns = true;
+                }
+                _ => {}
+            },
+            Ok(Event::End(ref e)) => match e.name().as_ref() {
+                b"page" => {
+                    if is_article {
+                        count += 1;
+                    }
+                    // reset flag
+                    is_article = true;
+                }
+                b"ns" => {
+                    inside_ns = false;
+                }
+                _ => {}
+            },
+            Ok(Event::Text(e)) if inside_ns => {
+                let ns = e.unescape().unwrap();
+                if ns != "0" {
+                    is_article = false; // It's not a main content page
+                }
             }
             Ok(Event::Eof) => break, // Exit the loop when reaching end of file
+            Ok(Event::Empty(ref e)) => match e.name().as_ref() {
+                b"redirect" => {
+                    is_article = false;
+                }
+                _ => {}
+            },
             Err(e) => return Err(e),
             _ => (), // There are several other Event variants that we do not handle here
         }
@@ -422,7 +450,6 @@ fn parse_articles(
                             if !title.is_empty() {
                                 let html_text = request_parse(&text, variant);
                                 if let Some(html_text) = html_text {
-                                    println!("{html_text}");
                                     let cleaned_text = html_to_text(&html_text, filter);
                                     if !cleaned_text.is_empty() {
                                         // Add to batch vectors
